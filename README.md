@@ -106,6 +106,8 @@ uv run playwright install chromium
 | --- | --- | --- |
 | `TARGET_USER` | `bhupen07` | 目标 X 账号的用户名（不带 `@`） |
 | `DATA_DIR` | `data` | 数据文件的保存根目录 |
+| `SINCE_DATE` | 空（不限制） | 可选：抓取起始日期（含当天，格式 `YYYY-MM-DD`，如 `2025-01-01`）；滚动到早于该日期的推文时自动停止当前子页面 |
+| `UNTIL_DATE` | 空（不限制） | 可选：抓取结束日期（含当天，格式 `YYYY-MM-DD`，如 `2025-12-31`）；晚于该日期的推文跳过不保存 |
 | `CHROME_PATH` | 自动查找本机 Chrome | 本机 Google Chrome 可执行文件路径（macOS 默认 `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`） |
 | `CHROME_USER_DATA_DIR` | `.chrome_profile` | 本地 Chrome 用户数据目录，用于保存登录状态 |
 | `PROXY` | 空（使用系统网络） | 可选代理地址，例如 `http://127.0.0.1:7890` |

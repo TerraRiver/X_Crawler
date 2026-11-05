@@ -49,6 +49,26 @@ def _default_chrome_path() -> str | None:
     return None
 
 
+def _parse_date_bound(raw: str | None, is_end: bool = False) -> str | None:
+    """Normalize YYYY-MM-DD (or YYYY/MM/DD or ISO 8601) into UTC ISO 8601 string."""
+    if not raw or not raw.strip():
+        return None
+    val = raw.strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            dt = datetime.strptime(val, fmt)
+            suffix = "T23:59:59Z" if is_end else "T00:00:00Z"
+            return dt.strftime("%Y-%m-%d") + suffix
+        except ValueError:
+            pass
+    try:
+        dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        print(f"[!] 环境变量时间格式无效：{val!r}（请使用 YYYY-MM-DD 格式，如 2025-01-01），已忽略该参数")
+        return None
+
+
 TARGET_USER          = os.getenv("TARGET_USER", "bhupen07").strip().lstrip("@").strip()
 DATA_DIR             = Path(os.getenv("DATA_DIR", "data").strip() or "data")
 COOKIE_FILE          = "browser_cookies.json"
@@ -56,6 +76,10 @@ PROXY                = os.getenv("PROXY") or None
 CHROME_PATH          = os.getenv("CHROME_PATH") or _default_chrome_path()
 CHROME_USER_DATA_DIR = os.getenv("CHROME_USER_DATA_DIR", ".chrome_profile").strip()
 HEADLESS_ENV         = os.getenv("HEADLESS", "").strip().lower()
+SINCE_DATE_RAW       = os.getenv("SINCE_DATE", "").strip()
+UNTIL_DATE_RAW       = os.getenv("UNTIL_DATE", "").strip()
+SINCE_BOUND          = _parse_date_bound(SINCE_DATE_RAW, is_end=False)
+UNTIL_BOUND          = _parse_date_bound(UNTIL_DATE_RAW, is_end=True)
 
 # Per-user output directory: data/<TARGET_USER>/
 USER_DATA_DIR = DATA_DIR / TARGET_USER
@@ -329,6 +353,14 @@ class TimelineCollector:
         self.response_event = asyncio.Event()
         self.rate_limited = False
         self.user_profile: dict[str, Any] | None = None
+        if PROFILE_FILE.exists():
+            try:
+                with open(PROFILE_FILE, encoding="utf-8") as f:
+                    loaded_prof = json.load(f)
+                if isinstance(loaded_prof, dict) and loaded_prof.get("screen_name", "").lower() == self.target_user:
+                    self.user_profile = loaded_prof
+            except Exception:
+                pass
 
         # Checkpoint / cursor management
         self.current_label: str = ""
@@ -337,6 +369,7 @@ class TimelineCollector:
         self.cursors: dict[str, str] = {}
         self.completed_tabs: set[str] = set()
         self.empty_timeline_responses: int = 0
+        self.consecutive_older_than_since: int = 0
 
         # Pre-populate tweet_pool with any existing loaded tweets
         for t in sink.values():
@@ -518,12 +551,12 @@ class TimelineCollector:
         raw_nodes = _iter_tweet_result_nodes(payload)
         bottom_cursor = _extract_bottom_cursor(payload)
         if not raw_nodes:
-            if bottom_cursor is not None:
-                self.empty_timeline_responses += 1
-            elif isinstance(payload.get("errors"), list):
+            if isinstance(payload.get("errors"), list) and "data" not in payload:
                 err_str = " ".join(str(e.get("message", "")) for e in payload["errors"] if isinstance(e, dict))
                 if "rate limit" in err_str.lower():
                     self.rate_limited = True
+            elif bottom_cursor is not None or "data" in payload:
+                self.empty_timeline_responses += 1
             self.skip_first_cursor_save = False
             self.response_event.set()
             return
@@ -551,6 +584,16 @@ class TimelineCollector:
 
             # Strictly ensure the tweet was posted/retweeted/replied by the target user
             if parsed["author"].lower() != self.target_user:
+                continue
+
+            created_at = parsed.get("created_at") or ""
+            if SINCE_BOUND and created_at and created_at < SINCE_BOUND:
+                self.consecutive_older_than_since += 1
+                continue
+            if created_at:
+                self.consecutive_older_than_since = 0
+
+            if UNTIL_BOUND and created_at and created_at > UNTIL_BOUND:
                 continue
 
             if self.tweet_filter(parsed) and parsed["id"] not in self.sink:
@@ -706,6 +749,10 @@ def _print_user_profile_banner(profile: dict[str, Any] | None, existing_count: i
         print(f"  │ 帖子总数：{total_tweets:,} 条{media_part}")
     if followers is not None or following is not None:
         print(f"  │ 社交数据：关注 {following or 0:,}  |  粉丝 {followers or 0:,}")
+    if SINCE_BOUND or UNTIL_BOUND:
+        since_str = SINCE_DATE_RAW or "最早"
+        until_str = UNTIL_DATE_RAW or "最新"
+        print(f"  │ 时间范围：{since_str}  →  {until_str}")
     print(f"  │ 本地已存：{existing_count:,} 条（{OUTPUT_FILE}）")
     print(f"  └──────────────────────────────────────────────────────────")
 
@@ -745,7 +792,7 @@ async def _recover_from_rate_limit(
 
 
 _POSTS_TIMELINE_RE = re.compile(
-    r"/graphql/[^/]+/(?:User(?:Originals|Tweets|Posts)|Profile)\w*Timeline\w*|/graphql/[^/]+/UserTweets$"
+    r"/graphql/[^/]+/(?:User(?:Originals|Tweets|Posts)|Profile)\w*Timeline\w*|/graphql/[^/]+/UserTweets(?:\?|$)"
 )
 _REPOSTS_TIMELINE_RE = re.compile(r"/graphql/[^/]+/UserRepostsTimeline\w*")
 _REPLIES_TIMELINE_RE = re.compile(r"/graphql/[^/]+/User(?:RepliesTimeline\w*|TweetsAndReplies)")
@@ -771,6 +818,7 @@ async def crawl_page(
     collector.response_event.clear()
     collector.rate_limited = False
     collector.empty_timeline_responses = 0
+    collector.consecutive_older_than_since = 0
     collector.skip_first_cursor_save = bool(resume_cursor)
 
     # Set or clear the in-page XHR resume cursor & endpoint filter before navigating or clicking tab
@@ -797,8 +845,8 @@ async def crawl_page(
             if is_selected != "true":
                 print(f"\n[*] 切换至子页面：{url}（【{label}】）")
                 try:
-                    await page.evaluate("window.scrollTo({top: 0, behavior: 'smooth'})")
-                    await asyncio.sleep(0.8)
+                    await page.evaluate("window.scrollTo(0, 0)")
+                    await asyncio.sleep(0.5)
                     collector.seen_timeline_ids.clear()
                     collector.response_event.clear()
                     collector.empty_timeline_responses = 0
@@ -818,6 +866,15 @@ async def crawl_page(
     except asyncio.TimeoutError:
         pass
 
+    # Fallback: if tab click did not trigger response, navigate directly to URL
+    if switched_via_tab and not collector.seen_timeline_ids and collector.empty_timeline_responses == 0:
+        try:
+            collector.response_event.clear()
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.wait_for(collector.response_event.wait(), timeout=12.0)
+        except Exception:
+            pass
+
     # If direct URL navigation landed on the default tab instead of the requested tab, click the tab
     if tab_href and not collector.seen_timeline_ids and collector.empty_timeline_responses == 0:
         tab_locator = page.locator(f'[role="tablist"] [role="tab"][href="{tab_href}" i]')
@@ -825,6 +882,8 @@ async def crawl_page(
             is_selected = await tab_locator.first.get_attribute("aria-selected")
             if is_selected != "true":
                 try:
+                    await page.evaluate("window.scrollTo(0, 0)")
+                    await asyncio.sleep(0.4)
                     collector.response_event.clear()
                     await page.evaluate(init_js)
                     await human_move_and_click(page, tab_locator.first, f"顶部【{label}】标签页")
@@ -883,6 +942,13 @@ async def crawl_page(
         _save_intermediate(collector.sink)
         last_saved = len(collector.sink)
 
+    if SINCE_BOUND and collector.consecutive_older_than_since >= 5:
+        print(f"  [{label}] 首屏已到达起始日期 ({SINCE_DATE_RAW}) 之前，当前子页面抓取结束")
+        collector.completed_tabs.add(label)
+        collector.cursors.pop(label, None)
+        save_checkpoint_state(collector.cursors, collector.completed_tabs)
+        return
+
     while no_new < MAX_NO_NEW:
         step += 1
         collector.response_event.clear()
@@ -918,11 +984,14 @@ async def crawl_page(
             else:
                 fast_scroll = True
                 print(
-                    f"  [{label}] 滚动 {step}，本页无新目标推文（已跳过重复/他人节点 {new_seen} 个），累计 {len(collector.sink)} 条"
+                    f"  [{label}] 滚动 {step}，本页无新目标推文（已跳过重复/范围外/他人节点 {new_seen} 个），累计 {len(collector.sink)} 条"
                 )
             if len(collector.sink) - last_saved >= SAVE_INTERVAL:
                 _save_intermediate(collector.sink)
                 last_saved = len(collector.sink)
+            if SINCE_BOUND and collector.consecutive_older_than_since >= 5:
+                print(f"  [{label}] 已滚动至起始日期 ({SINCE_DATE_RAW}) 之前，当前子页面抓取结束")
+                break
         elif not was_rate_limited:
             if resume_cursor and step <= 2 and collector.empty_timeline_responses >= 1:
                 print(f"  [断点续传] 上次保存的游标已到达【{label}】时间线最底部，本栏无需继续翻页")
@@ -1016,6 +1085,13 @@ def load_checkpoint_state() -> tuple[dict[str, str], set[str]]:
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             data = json.load(f)
+        saved_since = data.get("since_date")
+        saved_until = data.get("until_date")
+        if (saved_since or SINCE_BOUND or saved_until or UNTIL_BOUND) and (
+            saved_since != SINCE_BOUND or saved_until != UNTIL_BOUND
+        ):
+            print("[*] 检测到 .env 时间范围配置变更，已重置子页面翻页断点状态。")
+            return {}, set()
         raw_cursors = data.get("cursors", {})
         cursors = dict(raw_cursors) if isinstance(raw_cursors, dict) else {}
         raw_completed = data.get("completed_tabs", [])
@@ -1039,6 +1115,8 @@ def save_checkpoint_state(cursors: dict[str, str], completed_tabs: set[str] | No
     payload = {
         "target_user": TARGET_USER,
         "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "since_date": SINCE_BOUND,
+        "until_date": UNTIL_BOUND,
         "cursors": cursors,
         "completed_tabs": sorted(completed_tabs) if completed_tabs else [],
     }
@@ -1259,7 +1337,8 @@ async def async_main() -> None:
                         endpoint_re=_POSTS_TIMELINE_RE,
                         endpoint_substr="Originals",
                     )
-                    shown_banner = True
+                    if collector.user_profile:
+                        shown_banner = True
 
             if "reposts" in selected:
                 lbl = "纯转推(Reposts)"
@@ -1278,7 +1357,8 @@ async def async_main() -> None:
                         endpoint_re=_REPOSTS_TIMELINE_RE,
                         endpoint_substr="Reposts",
                     )
-                    shown_banner = True
+                    if collector.user_profile:
+                        shown_banner = True
 
             if "replies" in selected:
                 lbl = "回复(Replies)"
@@ -1297,7 +1377,8 @@ async def async_main() -> None:
                         endpoint_re=_REPLIES_TIMELINE_RE,
                         endpoint_substr="Replies",
                     )
-                    shown_banner = True
+                    if collector.user_profile:
+                        shown_banner = True
 
             print("[+] 完成。")
 

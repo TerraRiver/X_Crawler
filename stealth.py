@@ -132,6 +132,8 @@ async def human_scroll_to_element(page: Page, locator: Locator, target_desc: str
     target_band_y = vh * random.uniform(0.24, 0.42)
     total_scrolled = 0.0
     scroll_steps = 0
+    prev_y: float | None = None
+    stalled_steps = 0
 
     for _ in range(25):
         try:
@@ -140,6 +142,15 @@ async def human_scroll_to_element(page: Page, locator: Locator, target_desc: str
             box = None
         if not box:
             break
+
+        if prev_y is not None:
+            if abs(box["y"] - prev_y) < 1.0:
+                stalled_steps += 1
+                if stalled_steps >= 2:
+                    break
+            else:
+                stalled_steps = 0
+        prev_y = box["y"]
 
         diff_y = box["y"] - target_band_y
         if abs(diff_y) <= 70:
@@ -300,8 +311,16 @@ async def human_move_and_click(page: Page, locator: Locator, action_desc: str = 
         except Exception:
             box = None
 
-    if not box:
-        log_step(f"🖱️ 点击【{action_desc}】（未获取到坐标框，执行直接点击）")
+    if not box or box["y"] < 0 or box["y"] + box["height"] > viewport["height"]:
+        try:
+            await locator.scroll_into_view_if_needed(timeout=3000)
+            await page.wait_for_timeout(300)
+            box = await locator.bounding_box()
+        except Exception:
+            box = None
+
+    if not box or box["y"] < 0 or box["y"] + box["height"] > viewport["height"]:
+        log_step(f"🖱️ 点击【{action_desc}】（元素不在可视视口内，执行直接点击）")
         await locator.click()
         return
 
