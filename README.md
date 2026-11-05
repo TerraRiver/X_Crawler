@@ -35,16 +35,16 @@ flowchart TD
     ScrollLoop --> Intercept["8. 监听并解析对应的 GraphQL 时间线接口 JSON"]
     Intercept --> Filter["过滤 promoted 广告，校验推文作者等于 TARGET_USER"]
     Filter --> Extract["提取正文 (含 note_tweet 长文)、被引用推文 (quoted_tweet)、被回复原帖 (reply_to)"]
-    Extract --> Persist["9. 新数据先追加写入中断日志 (fsync)，再推进 state.json 翻页游标"]
+    Extract --> Persist["9. 新数据先追加写入 tweets.journal.jsonl 并落盘，再更新 state.json 翻页游标"]
 
     Persist --> RateLimit{"是否遇到 HTTP 429 限流?"}
-    RateLimit -- "是" --> WaitRetry["按 x-rate-limit-reset 或指数退避等待后重试 (最多 4 次)"] --> ScrollLoop
-    RateLimit -- "多次限流" --> KeepCursor["保留断点并结束本次运行"]
+    RateLimit -- "是" --> WaitRetry["按 x-rate-limit-reset 或 60s/120s/240s 递增等待后重试 (最多 4 次)"] --> ScrollLoop
+    RateLimit -- "多次限流" --> KeepCursor["保留当前翻页游标，停止继续抓取"]
     RateLimit -- "否" --> EndCheck{"是否到达页面底部?"}
     EndCheck -- "否" --> ScrollLoop
     EndCheck -- "是 (或到达起始日期)" --> MarkDone["标记当前子页面已完成，进入下一个子页面"]
-    EndCheck -- "连续 12 次无新数据" --> KeepCursor2["视为异常中止：不标记完成，保留断点"]
-    MarkDone --> FinalSave["10. 全部完成或 Ctrl+C 中断时导出 tweets.json 并关闭浏览器"]
+    EndCheck -- "连续 12 次无新数据" --> KeepCursor2["不标记当前子页面完成，保留翻页游标"]
+    MarkDone & KeepCursor & KeepCursor2 --> FinalSave["10. 全部结束或 Ctrl+C 中断时导出 tweets.json 并关闭浏览器"]
 ```
 
 ### 按运行顺序的功能说明
@@ -54,7 +54,6 @@ flowchart TD
    - 自动读取 `data/<TARGET_USER>/` 目录下已有的 `tweets.json`（历史推文）和 `state.json`（上次记录的翻页游标与已完成子页面列表）。若本地已有数据，可选择断点续传、从头扫描或清空重抓。
 2. **启动本地浏览器（`x_crawler/browser.py`）**
    - 启动本机安装的 Google Chrome，加载 `.chrome_profile/` 目录中的浏览器配置与缓存；去掉 `--enable-automation` 启动参数（不显示“正受到自动测试软件的控制”提示条），并启用 `--disable-blink-features=AutomationControlled`。
-   - 不再向页面注入任何修改浏览器属性的 JS 脚本：真实 Chrome + 持久化配置本身就是最自然的环境，额外的属性补丁反而会形成可被检测的特征。
    - 若配置目录被正在运行的 Chrome 占用，会直接提示关闭 Chrome；只有在 Chrome 无法启动时才回退到 Playwright Chromium，并使用独立的 `<CHROME_USER_DATA_DIR>_chromium/` 目录（避免版本不一致损坏 Chrome 配置）。
 3. **检查与保持登录状态**
    - 检查浏览器会话中是否存在有效的 `auth_token` Cookie：若已存在则直接进入抓取流程；若不存在但项目根目录下有 `browser_cookies.json`，则自动导入该文件中的 Cookie；若均无，则在打开的 Chrome 窗口中跳转登录页，等待用户手动完成登录（最长等待 3 分钟），登录状态自动保存在 `.chrome_profile/` 中供后续复用。
@@ -63,7 +62,7 @@ flowchart TD
    - 在开始滚动抓取前，于终端显示目标账号的昵称、总发帖数、媒体帖数、关注数、粉丝数以及本地已保存的推文条数，并将账号资料保存至 `data/<TARGET_USER>/profile.json`。
 5. **切换子页面与注入断点游标**
    - 按所选范围依次访问 `Posts`（`/user`）、`Reposts`（`/user/reposts`）、`Replies`（`/user/with_replies`）三个子页面；在不同子页面之间切换时，先滚动回页面顶部，再移动鼠标点击对应的顶部标签。
-   - 若处于断点续传模式：已抓取到底部的子页面会直接跳过；未抓完的子页面通过 Playwright `page.route` 将该子页面**首个时间线请求**的 `variables.cursor` 改写为上次保存的游标，页面直接从中断位置开始加载（不向页面注入任何脚本）。若未能拦截到请求，会在终端给出警告并从顶部扫描，原游标保留不被覆盖。
+   - 若处于断点续传模式：已抓取到底部的子页面会直接跳过；未抓完的子页面通过 Playwright `page.route` 将该子页面**首个时间线请求**的 `variables.cursor` 改写为上次保存的游标，页面直接从中断位置开始加载。若未能拦截到请求，会在终端给出警告并从顶部扫描，原游标保留不被覆盖。
 6. **模拟鼠标滚轮滚动与鼠标移动点击（`x_crawler/stealth.py`）**
    - 在子页面中通过 `page.mouse.wheel()` 分多次向下滚动页面以触发翻页请求，滚动间隙随机移动鼠标位置或小幅向上回滚。
    - 点击页面元素（如切换顶部标签页或点击重试按钮）时，记录上一次鼠标停留坐标，按曲线轨迹分步移动鼠标至目标元素内部后再执行按下与抬起操作。
@@ -74,12 +73,12 @@ flowchart TD
    - **超过 280 字的长推文**：优先读取 JSON 中的 `note_tweet` 字段获取未截断全文，并将 HTML 转义字符（如 `&amp;`、`&gt;`）还原为普通字符。
    - **纯转推（`type = "retweet"`）**：从内嵌的 `retweeted_status_result` 字段中提取原作者用户名（`original_author`）与未截断的原帖全文。
    - **被引用的推文（`quoted_tweet`）**：当推文包含引用转发（Quote Post）时，从 `quoted_status_result` 字段中提取被引用原帖的 ID、作者、发布时间与正文。
-   - **被回复的原帖（`reply_to`）**：当推文属于回复（`type = "reply"`）时，从同一接口返回的对话列表中查找被回复的上游原帖，记录其 ID、作者、发布时间与正文。
+   - **被回复的原帖（`reply_to`）**：当推文属于回复（`type = "reply"`）时，从接口返回的对话列表中查找被回复的原帖（若原帖在后续翻页中出现也会自动补全），记录其 ID、作者、发布时间与正文。
 9. **安全保存、限流等待与结束归档（`x_crawler/storage.py`）**
-   - 每收到一页数据，新增（或补全了回复上下文）的推文会先追加写入 `tweets.journal.jsonl` 中断日志并 `fsync`，**之后**才把新的翻页游标写入 `state.json`，因此断点游标永远不会超前于已落盘的数据（即使进程被强杀或断电）。
-   - 每累计 200 条以及运行结束 / `Ctrl+C` 时，将全部数据去重排序后原子写入 `tweets.json`（临时文件 + `fsync` + 替换），随后清空中断日志；下次启动时若发现残留的中断日志，会自动合并恢复。
-   - 当接口返回 HTTP 429（请求频率限制）时，优先按响应头 `x-rate-limit-reset` 等待到限额重置，否则按 60s → 120s → 240s… 指数退避（单次最长 20 分钟），然后点击重试按钮继续；连续 4 次仍被限流则保留断点并结束本次运行。
-   - 只有**真正到达时间线底部**（接口连续返回空页）、到达 `SINCE_DATE` 或栏目本身为空时，才将子页面记入已完成列表；若因连续 12 次滚动无新数据而停止（可能是网络或接口异常），则**保留断点游标**，下次可继续续传。
+   - 每收到一页数据，新增（或补全了回复上下文）的推文会先追加写入 `tweets.journal.jsonl` 中断日志并刷新到磁盘，**之后**才把新的翻页游标写入 `state.json`，保证游标位置不会超过已写入磁盘的数据。
+   - 每累计 200 条以及运行结束 / `Ctrl+C` 时，将全部数据去重排序后先写入临时文件并落盘，再替换 `tweets.json`，随后清空中断日志；下次启动时若发现残留的中断日志，会自动合并恢复。
+   - 当接口返回 HTTP 429（请求频率限制）时，优先按响应头 `x-rate-limit-reset` 等待到限额重置，否则按 60 秒、120 秒、240 秒翻倍增加等待时间（单次最长 20 分钟），然后点击重试按钮继续；连续 4 次仍被限流则保留断点并结束本次运行。
+   - 只有**真正到达时间线底部**（接口返回无错误的空时间线或结束标记）、到达 `SINCE_DATE` 或栏目本身为空时，才将子页面记入已完成列表；若因连续 12 次滚动无新数据而停止（可能是网络或接口异常），则**保留断点游标**，下次可继续续传。
    - 若 `tweets.json` 无法解析，程序会直接中止且不改动该文件，避免历史数据被覆盖。
 
 ## 环境要求
