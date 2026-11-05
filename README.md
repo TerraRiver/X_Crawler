@@ -207,7 +207,7 @@ data/<TARGET_USER>/
 - `original_author`：当 `type` 为 `retweet` 时记录被转发原帖的作者用户名，其他类型为空字符串
 - `original_id` / `original_created_at`：当 `type` 为 `retweet` 时记录被转发原帖的 ID 与 UTC 发布时间，其他类型为 `null`（旧版本采集的记录可能没有这两个字段）
 - `text`：推文全文（当 `type` 为 `retweet` 时，记录被转发原帖的全文）
-- `reply_to`：当 `type` 为 `reply` 时，记录被回复原帖的 `id`、`author`、`created_at` 和 `text`；非回复时为 `null`（若被回复原帖已被删除或不可见，则 `text` 和 `created_at` 为 `null`）
+- `reply_to`：当 `type` 为 `reply` 时，记录被回复原帖的 `id`、`author`、`created_at` 和 `text`；非回复时为 `null`（若原帖为纯图片/视频无文字推文，则 `text` 为空字符串 `""`；若原帖已被删除或不可见，则 `text` 和 `created_at` 为 `null`）
 - `quoted_tweet`：当推文引用了其他推文时，记录被引用推文的 `id`、`author`、`created_at` 和 `text`；未引用时为 `null`
 
 ## X 个人主页帖子分类与接口说明（记录于 2026-11-06）
@@ -264,7 +264,7 @@ X 个人主页顶部共有 4 个标签页，前 3 个分别对应上述三类帖
 | **纯原创推文**<br>(`type = "tweet"`) | 不含 `legacy.retweeted_status_result`，且不含 `legacy.in_reply_to_status_id_str` | 若存在 `note_tweet.note_tweet_results.result.text`（超过 280 字的长推文）则读取该字段；否则读取 `legacy.full_text`。 |
 | **带评论引用推文**<br>(`type = "tweet"`，含 `quoted_tweet`) | 存在 `quoted_status_result.result`，且不含 `legacy.retweeted_status_result` | 用户自己写的评论从外层 `note_tweet` 或 `legacy.full_text` 读取；被引用的原帖信息从内嵌的 `quoted_status_result.result` 对象中读取。 |
 | **纯转推**<br>(`type = "retweet"`) | 存在 `legacy.retweeted_status_result.result` | 外层 `legacy.full_text` 会被截断；需从 `legacy.retweeted_status_result.result` 中读取原作者用户名与原帖完整正文。 |
-| **回复**<br>(`type = "reply"`，含 `reply_to`) | 存在 `legacy.in_reply_to_status_id_str`（或 `in_reply_to_user_id_str`） | 被回复原帖的 ID 保存在 `in_reply_to_status_id_str`；被回复原帖的正文可从同一批次响应的对话条目（`TimelineTimelineModule.items`）中按推文 ID 匹配获取。 |
+| **回复**<br>(`type = "reply"`，含 `reply_to`) | 存在 `legacy.in_reply_to_status_id_str`（或 `in_reply_to_user_id_str`） | 被回复原帖的 ID 保存在 `in_reply_to_status_id_str`；被回复原帖的正文可从同一批次或后续翻页响应的对话条目（`TimelineTimelineModule.items`）中按推文 ID 匹配获取。 |
 | **广告推文（需过滤）** | 外层条目 `entryId` 以 `"promoted-"` 开头，或包含 `promotedMetadata` 字段 | 属于推广广告，解析时直接跳过。 |
 | **受限或已删除推文** | `__typename` 为 `TweetWithVisibilityResults`、`TweetTombstone` 或 `TweetUnavailable` | `TweetWithVisibilityResults` 的实际推文数据包裹在内层 `.tweet` 字段中；`TweetTombstone` 与 `TweetUnavailable` 表示推文已删除或无权限查看，不包含正文数据。 |
 
@@ -277,9 +277,9 @@ X 个人主页顶部共有 4 个标签页，前 3 个分别对应上述三类帖
 │   ├── cli.py             # 命令行入口、交互选择、整体流程编排
 │   ├── config.py          # 配置（.env + 命令行参数）与校验
 │   ├── browser.py         # Chrome 启动、Cookie 导入、登录检测
-│   ├── crawler.py         # 子页面表、滚动循环、限流退避、page.route 断点续传
+│   ├── crawler.py         # 子页面表、滚动循环、限流等待、page.route 断点续传
 │   ├── collector.py       # GraphQL 响应监听、过滤、回复上下文补全、落盘顺序控制
-│   ├── parser.py          # 纯函数 GraphQL 解析（无 Playwright 依赖）
+│   ├── parser.py          # GraphQL JSON 数据解析（不依赖浏览器）
 │   ├── storage.py         # tweets.json / 中断日志 / state.json / profile.json 读写
 │   └── stealth.py         # 鼠标移动、滚轮滚动、点击模拟
 ├── tests/                 # 单元测试（基于合成 GraphQL 数据，无需浏览器）
@@ -310,7 +310,7 @@ data/                 # 抓取结果保存目录
 - **如何切换登录的 X 账号？**
   删除项目根目录下的 `.chrome_profile/` 文件夹（如果存在 `browser_cookies.json` 也一并删除），重新运行 `uv run python main.py`，在弹出的 Chrome 窗口中登录新账号即可。
 - **遇到“触发 X 接口频率限制 (429)”提示怎么办？**
-  X 对单个账号在短时间内的翻页请求次数有限制（通常以 15 分钟为窗口）。程序会按响应头中的重置时间或指数退避自动等待并重试；连续 4 次仍被限流时会保留断点并结束运行，稍后选择“断点续传”即可继续。
+  X 对单个账号在短时间内的翻页请求次数有限制（通常以 15 分钟为窗口）。程序会按响应头中的重置时间或按 60 秒、120 秒、240 秒递增等待后自动重试；连续 4 次仍被限流时会保留断点并结束运行，稍后选择“断点续传”即可继续。
 - **提示“浏览器配置目录正被其他 Chrome 进程占用”？**
   关闭所有使用 `.chrome_profile/` 的 Chrome 窗口后重试。
 - **提示数据文件无法读取并中止？**
