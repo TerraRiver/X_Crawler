@@ -1,13 +1,10 @@
 [project]
 name = "x-crawler"
-version = "0.1.0"
-description = "Selenium-based crawler and analysis toolkit for public X timelines"
+version = "0.2.0"
+description = "Playwright & GraphQL-based crawler for X (Twitter) user timelines and replies"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "openai>=2.37.0",
+    "playwright>=1.50.0",
     "python-dotenv>=1.2.2",
-    "selenium>=4.44.0",
-    "tqdm>=4.67.3",
-    "webdriver-manager>=4.0.2",
 ]

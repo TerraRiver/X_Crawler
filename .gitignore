@@ -2,10 +2,10 @@
 .env
 browser_cookies.json
 cookies.json
+.chrome_profile/
 
-# Generated data and reports
+# Generated data
 data/
-reports/
 
 # Python environments and caches
 .venv/
