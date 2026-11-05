@@ -1,4 +1,4 @@
-"""Human-like mouse / wheel / keyboard simulation helpers for Playwright pages."""
+"""Playwright 页面的鼠标移动、滚轮滚动、点击与逐字输入模拟辅助函数。"""
 
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ _FALLBACK_VIEWPORT = (1280.0, 900.0)
 
 async def viewport_size(page: Page) -> tuple[float, float]:
     """
-    Current viewport (width, height). With `no_viewport=True` Playwright reports None,
-    so fall back to the real window inner size measured in the page.
+    获取当前页面可视区域宽高 (width, height)。
+    当开启 `no_viewport=True` 时 Playwright 返回 None，此时通过页面内 `window.innerWidth/innerHeight` 读取真实窗口尺寸。
     """
     vs = page.viewport_size
     if vs:
@@ -44,7 +44,7 @@ async def human_wait(page: Page, min_ms: int, max_ms: int, reason: str = "") -> 
 
 
 async def _glide(page: Page, start: tuple[float, float], end: tuple[float, float], steps: int, delay: tuple[int, int]) -> None:
-    """Move the mouse roughly linearly with small physiological jitter."""
+    """将鼠标从起点分步平滑移向终点，途中带有小幅随机偏移。"""
     (sx, sy), (ex, ey) = start, end
     for i in range(1, steps + 1):
         t = i / steps

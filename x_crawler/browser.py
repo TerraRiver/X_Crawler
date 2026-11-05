@@ -1,4 +1,4 @@
-"""Local Chrome persistent session, cookie import and login checks."""
+"""本机 Chrome 持久化会话启动、Cookie 导入与登录状态检查。"""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ class NotLoggedInError(RuntimeError):
 
 
 def load_playwright_cookies(cookie_file: Path) -> list[dict[str, Any]]:
-    """Convert a browser-extension cookie export (EditThisCookie / Cookie-Editor) into Playwright cookies."""
+    """将浏览器扩展（EditThisCookie / Cookie-Editor）导出的 JSON 转换为 Playwright 可用的 Cookie 列表。"""
     with open(cookie_file, encoding="utf-8") as f:
         raw = json.load(f)
     if not isinstance(raw, list):
@@ -70,28 +70,28 @@ def load_playwright_cookies(cookie_file: Path) -> list[dict[str, Any]]:
 def _launch_kwargs(cfg: Config, user_data_dir: str) -> dict[str, Any]:
     args = ["--disable-blink-features=AutomationControlled"]
     if sys.platform.startswith("linux"):
-        # Only needed in containers / CI; on desktop it triggers an "unsupported flag" infobar.
+        # 仅在 Linux 容器或 CI 环境下需要；在桌面系统上开启会触发“不受支持的命令行标记”提示条
         args += ["--no-sandbox", "--disable-dev-shm-usage"]
     kwargs: dict[str, Any] = {
         "user_data_dir": user_data_dir,
         "headless": cfg.headless,
         "args": args,
-        # Removes the "Chrome is being controlled by automated test software" infobar / automation switch
+        # 移除“Chrome 正受到自动测试软件的控制”提示条及对应的自动化启动开关
         "ignore_default_args": ["--enable-automation"],
-        # Blocking service workers guarantees page.route() sees every GraphQL request (needed for resume)
+        # 禁用 Service Worker，确保 page.route() 能拦截到所有 GraphQL 请求（断点续传需要）
         "service_workers": "block" if cfg.block_service_workers else "allow",
     }
     if cfg.headless:
         kwargs["viewport"] = {"width": 1280, "height": 900}
     else:
-        kwargs["no_viewport"] = True  # use the real window size instead of an emulated viewport
+        kwargs["no_viewport"] = True  # 有头模式下直接使用真实窗口尺寸，不强制固定模拟视口
     if cfg.proxy:
         kwargs["proxy"] = {"server": cfg.proxy}
     return kwargs
 
 
 async def create_browser_session(pw: Playwright, cfg: Config) -> tuple[BrowserContext, Page]:
-    """Launch local Google Chrome with a persistent profile. Returns (context, page)."""
+    """启动带有持久化配置目录的本机 Google Chrome，返回 (context, page)。"""
     kwargs = _launch_kwargs(cfg, cfg.chrome_user_data_dir)
     if cfg.chrome_path and Path(cfg.chrome_path).exists():
         kwargs["executable_path"] = cfg.chrome_path
@@ -108,7 +108,7 @@ async def create_browser_session(pw: Playwright, cfg: Config) -> tuple[BrowserCo
             raise BrowserLaunchError(
                 f"浏览器配置目录 {cfg.chrome_user_data_dir}/ 正被其他 Chrome 进程占用，请先关闭使用该目录的 Chrome 窗口后重试。"
             ) from exc
-        # Never open a Chrome profile with bundled Chromium (version mismatch can corrupt it)
+        # 不使用内置 Chromium 直接打开 Chrome 的配置目录，防止因版本差异损坏原配置
         fallback_dir = f"{cfg.chrome_user_data_dir.rstrip('/')}_chromium"
         log.warning("[!] 启动%s失败：%s", browser_desc, msg.splitlines()[0] if msg else exc)
         log.warning("[!] 回退为 Playwright Chromium，使用独立配置目录 %s/（需要重新登录）", fallback_dir)
@@ -123,7 +123,7 @@ async def create_browser_session(pw: Playwright, cfg: Config) -> tuple[BrowserCo
 
     log.info("[*] 已启动 %s%s", browser_desc, "（无头模式）" if cfg.headless else "")
 
-    # Reuse the first tab and close any leftover tabs from previous sessions
+    # 复用第一个标签页，并关闭上次会话可能残留的多余标签页
     pages = list(context.pages)
     page = pages[0] if pages else await context.new_page()
     for extra in pages[1:]:
@@ -135,7 +135,7 @@ async def create_browser_session(pw: Playwright, cfg: Config) -> tuple[BrowserCo
 
 
 async def has_auth_cookie(context: BrowserContext) -> bool:
-    """Check whether X's core `auth_token` session cookie exists and is non-empty."""
+    """检查浏览器会话中是否存在非空的 X 登录凭证 `auth_token` Cookie。"""
     try:
         cookies = await context.cookies(["https://x.com", "https://twitter.com"])
     except Exception as exc:
@@ -150,14 +150,14 @@ def is_login_path(url: str) -> bool:
 
 
 async def is_logged_in(page: Page) -> bool:
-    """Verify login state using both URL path check and `auth_token` cookie presence."""
+    """同时检查当前页面 URL 是否处于登录流程以及是否存在 `auth_token` Cookie。"""
     if is_login_path(page.url):
         return False
     return await has_auth_cookie(page.context)
 
 
 async def ensure_logged_in(context: BrowserContext, page: Page, cfg: Config) -> None:
-    """Make sure the session is authenticated (cookie import or interactive login). Raises NotLoggedInError."""
+    """确保当前会话已登录（支持自动导入 Cookie 文件或在窗口中手动登录）；未登录时抛出 NotLoggedInError。"""
     if not await has_auth_cookie(context) and cfg.cookie_file.exists():
         try:
             cookies = load_playwright_cookies(cfg.cookie_file)

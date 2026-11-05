@@ -1,4 +1,4 @@
-"""Passive GraphQL response collector: parses timeline payloads, filters records, persists safely."""
+"""GraphQL 时间线响应收集器：解析接口数据、过滤非目标记录、按顺序写入日志与断点游标。"""
 
 from __future__ import annotations
 
@@ -33,10 +33,10 @@ def _accept_all(_: dict[str, Any]) -> bool:
 
 class TimelineCollector:
     """
-    Intercepts X GraphQL timeline responses, resolves reply/quote contexts and manages checkpoints.
+    监听并处理 X 的 GraphQL 时间线响应，补全回复与引用上下文，并管理翻页断点状态。
 
-    Persistence order per response: new/updated records -> crash journal (fsync) -> cursor -> state.json.
-    The checkpoint therefore never points past data that is not on disk.
+    单页数据的落盘顺序：新增或更新记录 -> 追加写入中断日志并刷盘 -> 更新翻页游标 -> 写入 state.json，
+    保证断点游标不会超前于已写入磁盘的数据。
     """
 
     def __init__(
@@ -59,16 +59,16 @@ class TimelineCollector:
         self.pool.seed(sink.values(), default_author=target_user)
         self.user_profile: dict[str, Any] | None = storage.load_profile()
 
-        # parent tweet id -> ids of sink records whose reply_to context is still missing
+        # 被回复原帖 ID -> 尚未补全 reply_to 上下文的本地推文 ID 集合
         self._pending_replies: dict[str, set[str]] = {}
         for t in sink.values():
             self._track_pending_reply(t)
 
         self.response_event = asyncio.Event()
-        self.unexported = 0  # records appended to the journal since the last tweets.json export
-        self.dirty = False  # sink changed since the last export (independent of journal success)
+        self.unexported = 0  # 自上次导出 tweets.json 以来追加到中断日志的记录条数
+        self.dirty = False  # 自上次导出以来内存数据是否有新增或更新（不依赖中断日志是否写入成功）
 
-        # Per-tab state (reset by begin_tab)
+        # 当前子页面的运行状态（由 begin_tab 重置）
         self.current_label = ""
         self.expected_endpoint_re: re.Pattern[str] | None = None
         self.tweet_filter: TweetFilter = _accept_all
@@ -78,10 +78,10 @@ class TimelineCollector:
         self.consecutive_older_than_since = 0
         self.rate_limited = False
         self.rate_limit_reset: float | None = None
-        # While a resume cursor is pending but not yet injected, page-1 cursors must not overwrite it
+        # 当存在待注入的断点游标且尚未拦截到首个请求时，禁止用首屏游标覆盖原有断点
         self.hold_cursor = False
 
-    # ------------------------------------------------------------------ tab lifecycle
+    # ------------------------------------------------------------------ 子页面生命周期
 
     def begin_tab(
         self,
@@ -122,22 +122,22 @@ class TimelineCollector:
             return False
 
     def export(self) -> int:
-        """Write tweets.json (sorted) and clear the journal. Returns the number of records written."""
+        """将全部推文排序后写入 tweets.json 并清空中断日志，返回导出的总条数。"""
         count = self.storage.export(self.sink)
         self.unexported = 0
         self.dirty = False
         return count
 
     def flush_reply_contexts(self) -> int:
-        """Resolve any remaining reply contexts and journal the updated records."""
+        """补全剩余可匹配的被回复原帖上下文，并将更新后的记录写入中断日志。"""
         updated = self.resolve_missing_reply_contexts()
         self._journal(updated)
         return len(updated)
 
-    # ------------------------------------------------------------------ response handling
+    # ------------------------------------------------------------------ 响应监听处理
 
     async def handle_response(self, response: Response) -> None:
-        """Playwright passive response listener (profile metadata + timeline pages)."""
+        """Playwright 响应监听回调（处理账号资料接口与各子页面时间线接口）。"""
         url = response.url
         if USER_PROFILE_RE.search(url):
             if response.status == 200:
@@ -184,7 +184,7 @@ class TimelineCollector:
             self.storage.save_profile(info)
 
     def process_timeline_payload(self, payload: Any) -> ParsedPage:
-        """Parse one timeline page, store qualifying records, then advance the checkpoint cursor."""
+        """解析单页时间线数据，保存符合条件的推文记录，成功后推进断点游标。"""
         page = parse_timeline_payload(payload, self.pool, profile_screen_name=None if self.user_profile else self.target_user)
         if page.terminated_bottom:
             self.timeline_terminated = True
@@ -215,7 +215,7 @@ class TimelineCollector:
         journaled_ids = {r["id"] for r in to_journal}
         to_journal.extend(r for r in self.resolve_missing_reply_contexts() if r["id"] not in journaled_ids)
         if not self._journal(to_journal):
-            return page  # do NOT advance the cursor past data that is not on disk
+            return page  # 中断日志写入失败时不推进翻页游标，防止游标超前于已落盘的数据
 
         if page.bottom_cursor and self.current_label and not self.hold_cursor:
             self.state.cursors[self.current_label] = page.bottom_cursor
@@ -241,11 +241,11 @@ class TimelineCollector:
             log.error("[!] 写入中断日志失败（断点游标暂不推进）：%s", exc)
             return False
 
-    # ------------------------------------------------------------------ reply context backfill
+    # ------------------------------------------------------------------ 被回复原帖上下文补全
 
     def _track_pending_reply(self, record: dict[str, Any]) -> None:
         reply_to = record.get("reply_to")
-        # Unresolved = parent never seen (text and created_at both None). A media-only parent has text == "".
+        # 只有 text 和 created_at 同时为 None 时才表示尚未见过原帖（纯图片/视频无文字原帖的 text 为 ""）
         if isinstance(reply_to, dict) and reply_to.get("id") and reply_to.get("text") is None and reply_to.get("created_at") is None:
             self._pending_replies.setdefault(str(reply_to["id"]), set()).add(str(record["id"]))
 
@@ -254,7 +254,7 @@ class TimelineCollector:
         return sum(len(v) for v in self._pending_replies.values())
 
     def resolve_missing_reply_contexts(self) -> list[dict[str, Any]]:
-        """Backfill reply_to text/created_at for parents seen after the reply. Returns updated records."""
+        """当被回复原帖在后续翻页中出现时，回填 reply_to 的发布时间与正文，返回已更新的记录列表。"""
         updated: list[dict[str, Any]] = []
         for parent_id in [pid for pid in self._pending_replies if pid in self.pool]:
             parent = self.pool.get(parent_id) or {}

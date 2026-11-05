@@ -1,4 +1,4 @@
-"""Tab navigation, scroll loop, rate-limit back-off and route-based checkpoint resume."""
+"""子页面切换、滚动抓取循环、429 限流等待与基于 page.route 的断点续传。"""
 
 from __future__ import annotations
 
@@ -30,13 +30,13 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# --- Tunables ---
-SCROLL_PAUSE = 3.0  # seconds to wait for a GraphQL response after each scroll
-MAX_NO_NEW = 12  # consecutive scrolls without any new timeline node before giving up (NOT "completed")
+# --- 滚动与限流运行参数 ---
+SCROLL_PAUSE = 3.0  # 每次向下滚动后等待 GraphQL 响应的最长秒数
+MAX_NO_NEW = 12  # 连续多少次滚动无任何新节点后停止当前栏目（此时视为异常中断，不标记完成）
 SCROLL_PIXELS = 2500
-EXPORT_INTERVAL = 200  # rewrite tweets.json after this many journaled records
+EXPORT_INTERVAL = 200  # 每累计写入多少条中断日志后自动导出一次 tweets.json
 INITIAL_RESPONSE_TIMEOUT = 12.0
-SINCE_STOP_STREAK = 5  # consecutive target tweets older than SINCE_DATE -> stop (tolerates pinned tweets)
+SINCE_STOP_STREAK = 5  # 连续遇到多少条早于 SINCE_DATE 的目标推文后停止（避免被单条置顶旧推文提前截断）
 
 MAX_RATE_LIMIT_RETRIES = 4
 RATE_LIMIT_BASE_WAIT = 60.0
@@ -47,16 +47,16 @@ RETRY_BUTTON_SELECTOR = "button:has-text('Retry'), button:has-text('重试')"
 
 
 # ---------------------------------------------------------------------------
-# Tab table
+# 子页面配置表
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class TabSpec:
-    key: str  # CLI type name
-    label: str  # human label, also the checkpoint key
+    key: str  # 命令行参数中的类型名称
+    label: str  # 终端显示名称，同时作为 state.json 中的断点键名
     path_suffix: str  # "" | "/reposts" | "/with_replies"
-    tweet_type: str  # record "type" kept when this tab is crawled alone
+    tweet_type: str  # 单独抓取该栏目时保留的推文 type 值
     endpoint_re: re.Pattern[str]
 
     def url(self, user: str) -> str:
@@ -105,14 +105,14 @@ class RateLimitExhausted(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
-# Rate limit back-off
+# 429 频率限制等待与恢复
 # ---------------------------------------------------------------------------
 
 
 def compute_rate_limit_wait(reset_epoch: float | None, attempt: int, now: float | None = None) -> float:
     """
-    Seconds to wait after HTTP 429. Prefer X's `x-rate-limit-reset` header (+ jitter),
-    otherwise exponential back-off 60s, 120s, 240s ... capped at RATE_LIMIT_MAX_WAIT.
+    计算触发 HTTP 429 后的等待秒数：优先采用响应头 `x-rate-limit-reset` 的重置时间戳（加随机缓冲），
+    否则按 60s、120s、240s 翻倍递增等待，单次不超过 RATE_LIMIT_MAX_WAIT。
     """
     now = time.time() if now is None else now
     if reset_epoch and reset_epoch > now:
@@ -173,15 +173,14 @@ async def recover_from_rate_limit(page: Page, collector: TimelineCollector, labe
 
 
 # ---------------------------------------------------------------------------
-# Route-based resume (replaces the old in-page XHR prototype patch)
+# 基于 page.route 的断点游标注入
 # ---------------------------------------------------------------------------
 
 
 class ResumeInjector:
     """
-    Rewrites `variables.cursor` of the first timeline GraphQL request of a tab to the saved checkpoint
-    cursor, so the timeline continues exactly where the previous run stopped. Nothing is injected
-    into the page; success is observable via `applied`.
+    通过 Playwright `page.route` 拦截当前子页面的首个时间线 GraphQL 请求，将其中的 `variables.cursor`
+    改写为上次保存的断点游标，使页面直接从中断位置继续加载，无需向页面注入任何脚本。
     """
 
     def __init__(self, page: Page, endpoint_re: re.Pattern[str], cursor: str, on_applied: Callable[[], None]) -> None:
@@ -220,7 +219,7 @@ class ResumeInjector:
 
 
 # ---------------------------------------------------------------------------
-# Banner
+# 终端账号信息面板
 # ---------------------------------------------------------------------------
 
 
@@ -245,7 +244,7 @@ def print_profile_banner(cfg: Config, profile: dict[str, Any] | None, existing_c
 
 
 # ---------------------------------------------------------------------------
-# Tab crawl
+# 单个子页面抓取流程
 # ---------------------------------------------------------------------------
 
 
@@ -264,7 +263,7 @@ async def _wait_response(collector: TimelineCollector, timeout: float) -> bool:
 
 
 async def _click_tab(page: Page, collector: TimelineCollector, cfg: Config, spec: TabSpec) -> bool:
-    """Switch to the tab via a human-like click if we are on the profile and it is not selected."""
+    """当已处于目标用户主页且目标标签尚未选中时，滚回顶部并点击对应标签切换子页面。"""
     tab = page.locator(f'[role="tablist"] [role="tab"][href="{spec.href(cfg.target_user)}" i]')
     try:
         if await tab.count() == 0 or await tab.first.get_attribute("aria-selected") == "true":
@@ -295,12 +294,12 @@ async def _open_tab(page: Page, collector: TimelineCollector, cfg: Config, spec:
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         except Exception as exc:
-            # A slow document load does not mean the timeline XHR failed; the checks below decide
+            # 页面文档加载慢不代表后台时间线接口失败，后续由响应等待逻辑判断是否成功捕获数据
             log.warning("  [!] 打开 %s 超时或失败：%s", url, str(exc).splitlines()[0] if str(exc) else exc)
 
     await _wait_response(collector, INITIAL_RESPONSE_TIMEOUT)
 
-    # Fallback: tab click did not trigger a timeline request -> navigate directly
+    # 回退处理 1：点击顶部标签未触发对应接口请求时，直接通过 URL 导航
     if switched and not _got_any_response(collector) and not collector.rate_limited:
         collector.response_event.clear()
         try:
@@ -309,7 +308,7 @@ async def _open_tab(page: Page, collector: TimelineCollector, cfg: Config, spec:
         except Exception as exc:
             log.debug("直接导航至 %s 失败：%s", url, exc)
 
-    # Direct navigation landed on the default tab -> click the requested tab
+    # 回退处理 2：直接访问子页面 URL 却落回默认标签页时，补点一次目标标签
     if not _got_any_response(collector) and not collector.rate_limited:
         collector.response_event.clear()
         if await _click_tab(page, collector, cfg, spec):
@@ -333,9 +332,8 @@ async def crawl_tab(
     show_banner: bool,
 ) -> CrawlOutcome:
     """
-    Crawl one profile tab. The tab is marked completed ONLY for genuine end conditions
-    (bottom reached / SINCE_DATE reached / empty tab); otherwise the cursor is kept for resume.
-    Raises NotLoggedInError when the session is not authenticated.
+    抓取单个子页面。仅在明确到达时间线底部、到达起始日期或栏目为空时才标记该栏目完成；
+    其他中断情况均保留断点游标供下次续传。未登录时抛出 NotLoggedInError。
     """
     collector.begin_tab(spec.label, spec.endpoint_re, _make_filter(spec, crawl_all), hold_cursor=bool(resume_cursor))
     injector: ResumeInjector | None = None
@@ -477,12 +475,12 @@ async def _crawl_tab_inner(
             return CrawlOutcome.REACHED_BOTTOM
 
         no_new += 1
-        # X sometimes shows "Something went wrong / Retry" on transient errors
+        # 当页面因瞬时接口错误出现“Something went wrong / Retry”按钮时，自动点击重试
         if await _click_retry_if_present(page, "时间线异常重试按钮"):
             await asyncio.sleep(2.0)
 
-    # X often sends a single empty page at the very end and then stops requesting: that is the bottom.
-    # Without any end signal (no responses / only errors) the tab is merely stalled and keeps its cursor.
+    # X 到达时间线最底部时常只返回一次无错误空页随后不再发起请求，此时视为正常触底；
+    # 若全程未收到任何空页或结束标记（如网络断开或持续报错），视为异常卡住并保留断点游标。
     if collector.timeline_terminated or collector.empty_timeline_responses >= 1:
         return CrawlOutcome.REACHED_BOTTOM
     return CrawlOutcome.STALLED

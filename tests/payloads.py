@@ -1,4 +1,4 @@
-"""Builders for synthetic X GraphQL payloads (shape mirrors real UserTweets / UserTweetsAndReplies responses)."""
+"""构建用于单元测试的合成 X GraphQL 响应数据（结构与真实 UserTweets / UserTweetsAndReplies 响应一致）。"""
 
 from __future__ import annotations
 

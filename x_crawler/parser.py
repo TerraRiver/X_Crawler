@@ -1,4 +1,4 @@
-"""Pure GraphQL payload parsing helpers (no Playwright dependency, fully unit-testable)."""
+"""GraphQL 接口 JSON 数据解析工具函数（无 Playwright 依赖，可直接用于单元测试）。"""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# Endpoint patterns
+# 接口 URL 匹配正则
 # ---------------------------------------------------------------------------
 
 TIMELINE_RE = re.compile(
@@ -24,12 +24,12 @@ USER_PROFILE_RE = re.compile(r"/graphql/[^/]+/UserByScreenName")
 _UNAVAILABLE_TYPENAMES = ("TweetTombstone", "TweetUnavailable", "TweetPreviewDisplay")
 
 # ---------------------------------------------------------------------------
-# Generic helpers
+# 通用辅助函数
 # ---------------------------------------------------------------------------
 
 
 def dig(obj: Any, *keys: Any, default: Any = None) -> Any:
-    """Safely walk nested dicts/lists; returns `default` on any missing key, None or type mismatch."""
+    """按路径安全读取嵌套字典或列表；遇到键不存在、值为 None 或类型不匹配时返回 `default`。"""
     cur = obj
     for key in keys:
         if isinstance(cur, dict):
@@ -48,7 +48,7 @@ def utc_now_iso() -> str:
 
 
 def parse_twitter_date(raw_date: Any) -> str:
-    """Convert X's 'Wed Oct 10 20:19:24 +0000 2018' into ISO 8601 UTC; returns '' if unparseable."""
+    """将 X 接口返回的 'Wed Oct 10 20:19:24 +0000 2018' 转换为 ISO 8601 UTC 时间字符串；无法解析时返回 ''。"""
     if not raw_date or not isinstance(raw_date, str):
         return ""
     try:
@@ -59,12 +59,12 @@ def parse_twitter_date(raw_date: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tweet / user field extraction
+# 推文与用户字段提取
 # ---------------------------------------------------------------------------
 
 
 def unwrap_tweet(result: Any) -> dict[str, Any] | None:
-    """Unwrap TweetWithVisibilityResults and filter out unavailable / tombstone objects."""
+    """解包 TweetWithVisibilityResults 包装层，并过滤已删除或不可见的推文节点。"""
     if not isinstance(result, dict):
         return None
     typename = result.get("__typename")
@@ -82,13 +82,13 @@ def tweet_id_of(tweet_obj: dict[str, Any]) -> str:
 
 
 def extract_screen_name(tweet_obj: dict[str, Any]) -> str:
-    """Extract author screen_name across both legacy and newer X GraphQL schemas."""
+    """从推文对象中提取作者用户名（兼容新旧两套 GraphQL 字段结构）。"""
     user_res = dig(tweet_obj, "core", "user_results", "result")
     return str(dig(user_res, "core", "screen_name") or dig(user_res, "legacy", "screen_name") or "")
 
 
 def extract_full_text(tweet_obj: dict[str, Any]) -> str:
-    """Extract full text, preferring the un-truncated note_tweet for long posts."""
+    """提取推文全文，长推文优先读取未截断的 note_tweet 字段，并还原 HTML 转义字符。"""
     note_text = dig(tweet_obj, "note_tweet", "note_tweet_results", "result", "text")
     if isinstance(note_text, str) and note_text:
         return html.unescape(note_text)
@@ -97,7 +97,7 @@ def extract_full_text(tweet_obj: dict[str, Any]) -> str:
 
 
 def extract_user_profile_info(user_res: Any) -> dict[str, Any] | None:
-    """Extract total post counts and profile metadata from a GraphQL User object."""
+    """从 GraphQL User 节点中提取发帖总数、粉丝数及个人简介等基本信息。"""
     if not isinstance(user_res, dict) or user_res.get("__typename") != "User":
         return None
 
@@ -134,12 +134,12 @@ def extract_user_profile_info(user_res: Any) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
-# Payload traversal
+# 响应 JSON 遍历
 # ---------------------------------------------------------------------------
 
 
 def iter_tweet_result_nodes(node: Any) -> list[dict[str, Any]]:
-    """Recursively collect all non-promoted `tweet_results.result` dicts in a GraphQL payload."""
+    """递归遍历 GraphQL 响应，收集所有非推广（非 promoted）的 `tweet_results.result` 字典。"""
     found: list[dict[str, Any]] = []
     stack: list[Any] = [node]
     while stack:
@@ -158,7 +158,7 @@ def iter_tweet_result_nodes(node: Any) -> list[dict[str, Any]]:
 
 
 def extract_bottom_cursor(node: Any) -> str | None:
-    """Extract the pagination Bottom cursor value from a GraphQL timeline payload."""
+    """从时间线 GraphQL 响应中提取向后翻页的 Bottom 游标值。"""
     stack: list[Any] = [node]
     while stack:
         obj = stack.pop()
@@ -172,7 +172,7 @@ def extract_bottom_cursor(node: Any) -> str | None:
 
 
 def has_bottom_terminator(node: Any) -> bool:
-    """True if the payload contains X's explicit end-of-timeline instruction (TimelineTerminateTimeline / Bottom)."""
+    """检查响应中是否包含 X 明确返回的时间线底部结束指令（TimelineTerminateTimeline / Bottom）。"""
     stack: list[Any] = [node]
     while stack:
         obj = stack.pop()
@@ -186,7 +186,7 @@ def has_bottom_terminator(node: Any) -> bool:
 
 
 def has_timeline_instructions(node: Any) -> bool:
-    """True if the payload carries an actual timeline `instructions` list (not just an empty/partial `data`)."""
+    """检查响应中是否包含实际的时间线 `instructions` 列表（排除空的或残缺的 `data` 对象）。"""
     stack: list[Any] = [node]
     while stack:
         obj = stack.pop()
@@ -207,7 +207,7 @@ def graphql_error_text(payload: Any) -> str:
 
 
 def inject_cursor_into_url(url: str, cursor: str) -> str | None:
-    """Return `url` with GraphQL `variables.cursor` set to `cursor`; None if the URL has no variables."""
+    """将请求 URL 查询参数中的 `variables.cursor` 改写为指定 `cursor`；若 URL 不含 variables 则返回 None。"""
     parts = urllib.parse.urlsplit(url)
     query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
     new_query = []
@@ -231,7 +231,7 @@ def inject_cursor_into_url(url: str, cursor: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Tweet pool & record building
+# 推文缓存池与输出记录组装
 # ---------------------------------------------------------------------------
 
 
@@ -242,7 +242,7 @@ def _basic_view(basic: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 class TweetPool:
-    """id -> basic tweet info for every tweet seen (incl. other authors) to resolve reply/quote context."""
+    """记录所有已见过推文（含其他用户推文）的基础信息（id -> basic），用于补全回复原帖与引用推文上下文。"""
 
     def __init__(self) -> None:
         self._pool: dict[str, dict[str, Any]] = {}
@@ -268,7 +268,7 @@ class TweetPool:
                 }
 
     def register(self, raw: Any) -> dict[str, Any] | None:
-        """Register a tweet (and its nested quoted / retweeted tweets) and return its basic info."""
+        """注册单条推文（及其内嵌的引用推文与被转发原帖），返回其基础信息字典。"""
         tweet_obj = unwrap_tweet(raw)
         if not tweet_obj:
             return None
@@ -291,7 +291,7 @@ class TweetPool:
         return basic
 
     def basic_of(self, raw: Any) -> dict[str, Any] | None:
-        """Look up the pooled basic info of a raw tweet node (registering it if needed)."""
+        """查询原始推文节点在缓存池中的基础信息（若未注册则先注册）。"""
         tweet_obj = unwrap_tweet(raw)
         if not tweet_obj:
             return None
@@ -299,7 +299,7 @@ class TweetPool:
 
 
 def build_tweet_record(raw: Any, pool: TweetPool) -> dict[str, Any] | None:
-    """Build the output record for one timeline tweet node (retweet / quote / reply aware)."""
+    """根据单个推文节点构建标准化输出字典（区分原创、纯转推、回复与引用推文）。"""
     tweet_obj = unwrap_tweet(raw)
     if not tweet_obj:
         return None
@@ -360,15 +360,15 @@ def build_tweet_record(raw: Any, pool: TweetPool) -> dict[str, Any] | None:
 class ParsedPage:
     records: list[dict[str, Any]] = field(default_factory=list)
     bottom_cursor: str | None = None
-    has_timeline: bool = False  # payload contains a real timeline `instructions` list
+    has_timeline: bool = False  # 响应中包含实际的时间线 `instructions` 列表
     error_text: str = ""
     terminated_bottom: bool = False
     author_profile: dict[str, Any] | None = None
 
     @property
     def is_empty_timeline(self) -> bool:
-        """True for a successful response that carries no tweets (end of timeline / empty tab)."""
-        # GraphQL errors often come with HTTP 200 and a (partial) "data" key: never treat those as "end of timeline"
+        """表示一次无错误且不包含任何推文的正常时间线响应（到达时间线末尾或该栏目为空）。"""
+        # GraphQL 报错常伴随 HTTP 200 和残缺的 "data" 字段，不能将带错误的响应视为“到底部”
         return not self.records and not self.error_text and (self.bottom_cursor is not None or self.has_timeline)
 
     @property
@@ -382,8 +382,8 @@ def parse_timeline_payload(
     profile_screen_name: str | None = None,
 ) -> ParsedPage:
     """
-    Parse a timeline GraphQL payload into output records (all authors) and pagination metadata.
-    If `profile_screen_name` is given, also extract that author's profile from embedded user objects.
+    解析单页时间线 GraphQL 响应，提取推文记录列表（含所有作者）与翻页游标信息。
+    若指定了 `profile_screen_name`，同时从推文内嵌的用户对象中提取该账号的资料。
     """
     page = ParsedPage()
     if not isinstance(payload, dict):
@@ -394,7 +394,7 @@ def parse_timeline_payload(
     page.terminated_bottom = has_bottom_terminator(payload)
 
     raw_nodes = iter_tweet_result_nodes(payload)
-    # Pass 1: register everything so parents / quotes in the same payload resolve regardless of order
+    # 第一遍：先将本页所有推文注册进缓存池，确保同一页内的被回复原帖与引用推文无论先后顺序都能匹配
     for node in raw_nodes:
         pool.register(node)
 

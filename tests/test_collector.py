@@ -105,7 +105,7 @@ class CollectorTests(unittest.TestCase):
         c.process_timeline_payload(P.timeline(P.entry(P.tweet("1", "bob", "parent"))))
         self.assertEqual(self.sink["2"]["reply_to"]["text"], "parent")
         self.assertEqual(c.pending_reply_count, 0)
-        self.assertEqual(self.journal_ids(), ["2", "2"])  # updated record re-journaled
+        self.assertEqual(self.journal_ids(), ["2", "2"])  # 补全上下文后的记录会再次写入中断日志
 
     def test_media_only_parent_not_pending_and_journaled_once(self):
         c = self.make()
@@ -116,13 +116,13 @@ class CollectorTests(unittest.TestCase):
         self.assertIsNotNone(self.sink["2"]["reply_to"]["created_at"])
         self.assertEqual(c.pending_reply_count, 0)
         self.assertEqual(self.journal_ids(), ["2"])
-        # Reloading the record must not re-flag it as missing context
+        # 重新加载已保存记录时，不应将纯媒体无文字原帖再次标记为缺失上下文
         c2 = TimelineCollector("alice", self.storage, dict(self.sink), CheckpointState())
         self.assertEqual(c2.pending_reply_count, 0)
 
     def test_same_page_unresolved_then_resolved_is_journaled_once(self):
         c = self.make()
-        # parent registered in the pool by an earlier page, reply arrives later: resolved at build time
+        # 原帖在更早的页面中已注册进缓存池，回复在后续页面到达时直接完成匹配，只写一次日志
         c.process_timeline_payload(P.timeline(P.entry(P.tweet("1", "bob", "parent"))))
         c.process_timeline_payload(P.timeline(P.entry(P.tweet("2", "alice", reply_to=("1", "bob")))))
         self.assertEqual(self.journal_ids(), ["2"])

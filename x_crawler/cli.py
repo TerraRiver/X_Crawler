@@ -1,4 +1,4 @@
-"""Command-line entry point: configuration, interactive prompts and orchestration of tab crawls."""
+"""命令行入口：配置加载、交互选项询问与多栏目抓取流程编排。"""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ def select_resume_mode(
     state: CheckpointState,
     active_labels: list[str],
 ) -> str:
-    """Returns 'resume' | 'from_top' | 'restart'."""
+    """返回运行模式：'resume'（断点续传）| 'from_top'（从头扫描）| 'restart'（清空重抓）。"""
     has_cursor = any(lbl in state.cursors for lbl in active_labels)
     has_partial = bool(state.completed_tabs) and any(lbl not in state.completed_tabs for lbl in active_labels)
     can_resume = has_cursor or has_partial
@@ -93,12 +93,12 @@ class RunPlan:
 
 
 def prepare(cfg: Config) -> RunPlan:
-    """Synchronous pre-browser phase: prompts, load data & checkpoint, apply the chosen mode."""
+    """启动浏览器前的同步准备阶段：询问抓取范围、读取本地数据与断点，并应用所选运行模式。"""
     from .crawler import TABS
 
     storage = Storage(cfg.data_dir, cfg.target_user)
     selected = cfg.types or select_types()
-    sink = storage.load_tweets()  # raises StorageError on corrupt data (never overwrite it)
+    sink = storage.load_tweets()  # 本地文件损坏时直接抛出 StorageError，避免覆盖原文件
     state = storage.load_state(cfg.since_bound, cfg.until_bound)
 
     active_labels = [t.label for t in TABS if t.key in selected]
@@ -116,7 +116,7 @@ def prepare(cfg: Config) -> RunPlan:
 
 
 async def run(cfg: Config, plan: RunPlan) -> int:
-    # Heavy imports are deferred so `--help` / config errors don't require Playwright
+    # 延迟导入 Playwright 相关模块，确保执行 `--help` 或配置校验报错时无需加载浏览器依赖
     from playwright.async_api import Error as PlaywrightError
     from playwright.async_api import async_playwright
 
@@ -156,7 +156,7 @@ async def run(cfg: Config, plan: RunPlan) -> int:
                         show_banner=not shown_banner,
                     )
                 except PlaywrightError as exc:
-                    # e.g. browser window closed / navigation crashed: keep the checkpoint, stop gracefully
+                    # 如手动关闭浏览器窗口或页面崩溃：保留当前断点并正常走退出保存流程
                     log.error("[!] [%s] 浏览器操作异常，已保留断点：%s", spec.label, str(exc).splitlines()[0] if str(exc) else exc)
                     exit_code = 1
                     break
@@ -171,7 +171,7 @@ async def run(cfg: Config, plan: RunPlan) -> int:
             log.error("[!] %s", exc)
             exit_code = 2
         finally:
-            # Always persist collected tweets & checkpoint, even on Ctrl+C / errors
+            # 无论正常结束、Ctrl+C 中断还是发生异常，均确保已采集数据与断点状态落盘
             collector.flush_reply_contexts()
             if not sink:
                 log.info("\n[!] 本次未采集到任何符合条件的推文，未生成文件。")
@@ -221,7 +221,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return asyncio.run(run(cfg, plan))
     except KeyboardInterrupt:
-        # run()'s finally block has already exported data & checkpoint
+        # run() 的 finally 块已完成数据与断点的保存
         print("\n[!] 用户中断运行。已采集的数据与断点均已保存，可选择“断点续传”继续。")
         return 130
 

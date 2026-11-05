@@ -1,4 +1,4 @@
-"""Runtime configuration: environment variables (.env) + command-line arguments."""
+"""运行配置：读取环境变量（.env）与命令行参数。"""
 
 from __future__ import annotations
 
@@ -20,11 +20,11 @@ _FALSE = ("false", "0", "no", "off")
 
 
 class ConfigError(ValueError):
-    """Raised for invalid user configuration (fail fast instead of silently ignoring)."""
+    """用户配置项无效时抛出，启动阶段直接报错退出。"""
 
 
 def _default_chrome_path() -> str | None:
-    """Detect local Google Chrome executable path."""
+    """自动查找本机 Google Chrome 可执行文件路径。"""
     candidates = [
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
@@ -51,7 +51,7 @@ def _parse_bool(raw: str | None, name: str) -> bool | None:
 
 
 def resolve_timezone(name: str | None) -> tzinfo | None:
-    """Return a tzinfo for an IANA name ('Asia/Shanghai', 'UTC'); None means system local time."""
+    """根据 IANA 时区名称（如 'Asia/Shanghai'、'UTC'）返回时区对象；为空则使用系统本地时区。"""
     if not name or not name.strip():
         return None
     name = name.strip()
@@ -61,20 +61,20 @@ def resolve_timezone(name: str | None) -> tzinfo | None:
         from zoneinfo import ZoneInfo
 
         return ZoneInfo(name)
-    except Exception as exc:  # ZoneInfoNotFoundError / ValueError
+    except Exception as exc:  # ZoneInfoNotFoundError 或 ValueError
         raise ConfigError(f"DATE_TZ 时区名称无效：{name!r}（示例：Asia/Shanghai、UTC）") from exc
 
 
 def _localize(dt: datetime, tz: tzinfo | None) -> datetime:
     if dt.tzinfo is not None:
         return dt
-    return dt.replace(tzinfo=tz) if tz is not None else dt.astimezone()  # naive -> system local tz
+    return dt.replace(tzinfo=tz) if tz is not None else dt.astimezone()  # 无时区时间默认按系统本地时区处理
 
 
 def parse_date_bound(raw: str | None, is_end: bool = False, tz: tzinfo | None = None) -> str | None:
     """
-    Normalize YYYY-MM-DD / YYYY/MM/DD / ISO 8601 into a UTC ISO 8601 string.
-    Date-only values are interpreted in `tz` (default: system local time zone) and cover the whole day.
+    将 YYYY-MM-DD / YYYY/MM/DD / ISO 8601 日期字符串转换为 UTC ISO 8601 字符串。
+    仅提供日期时按 `tz`（默认系统本地时区）解释，并覆盖当天全天（00:00:00 至 23:59:59）。
     """
     if not raw or not raw.strip():
         return None
@@ -116,7 +116,7 @@ def parse_types(raw: str | None) -> tuple[str, ...] | None:
             raise ConfigError(f"--types 中存在无效类型：{part!r}（可选：{', '.join(ALL_TYPES)}, all）")
         if part not in items:
             items.append(part)
-    # Keep canonical crawl order
+    # 保持固定的栏目抓取顺序（posts -> reposts -> replies）
     return tuple(t for t in ALL_TYPES if t in items) or None
 
 
@@ -134,8 +134,8 @@ class Config:
     until_raw: str
     since_bound: str | None
     until_bound: str | None
-    types: tuple[str, ...] | None = None  # None -> ask interactively
-    mode: str | None = None  # None -> ask interactively when needed
+    types: tuple[str, ...] | None = None  # 为 None 时在终端交互式询问
+    mode: str | None = None  # 为 None 时根据本地已有数据交互式询问
     verbose: bool = False
 
     @property
@@ -161,7 +161,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def build_config(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None) -> Config:
-    """Build configuration from CLI args (highest priority) and environment variables."""
+    """合并命令行参数（优先级更高）与环境变量，生成配置对象。"""
     env = os.environ if env is None else env
     args = build_arg_parser().parse_args(argv)
 

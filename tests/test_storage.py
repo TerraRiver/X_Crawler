@@ -40,7 +40,7 @@ class StorageTests(unittest.TestCase):
         loaded = self.s.load_tweets()
         self.assertEqual(set(loaded), {"1", "2"})
         self.assertEqual(loaded["1"]["text"], "updated")
-        self.assertFalse(self.s.journal_file.exists())  # merged into tweets.json
+        self.assertFalse(self.s.journal_file.exists())  # 已合并进 tweets.json 并清理中断日志
         self.assertEqual(len(json.loads(self.s.tweets_file.read_text(encoding="utf-8"))), 2)
 
     def test_legacy_migration_writes_before_delete_and_keeps_bad_files(self):

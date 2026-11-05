@@ -1,13 +1,12 @@
 """
-Persistence layer for one target user (`data/<user>/`):
+单个目标账号的数据读写管理（`data/<user>/`）：
 
-- tweets.json           Final export (JSON array sorted newest-first), rewritten atomically & periodically.
-- tweets.journal.jsonl  Append-only crash journal. Every new / updated record is appended (and fsynced)
-                        *before* the pagination cursor is advanced, so the checkpoint can never get ahead
-                        of persisted data. It is merged on load and truncated after each successful export.
-- state.json            Pagination cursors + completed tabs (checkpoint).
-- profile.json          Target user profile metadata.
-- backups/<ts>/         Files moved aside by "restart" mode instead of being deleted.
+- tweets.json           推文最终导出文件（按发布时间从新到旧排序的 JSON 数组），定期及结束时写入。
+- tweets.journal.jsonl  追加写入的中断日志文件。每条新增或补全上下文的记录都会在推进翻页游标之前
+                        先写入该文件并刷盘，保证游标不会超前于已落盘的数据。启动时自动合并并在导出后清空。
+- state.json            翻页游标与已完成子页面记录（断点状态）。
+- profile.json          目标账号基本信息。
+- backups/<时间戳>/     选择“清空重抓”时移入的旧数据备份目录。
 """
 
 from __future__ import annotations
@@ -27,7 +26,7 @@ from .parser import utc_now_iso
 
 log = logging.getLogger(__name__)
 
-# Legacy checkpoint keys from older versions -> current tab labels
+# 旧版本断点文件中的栏目名称 -> 当前版本的栏目名称
 LEGACY_TAB_KEYS = {
     "全部": "回复(Replies)",
     "回复": "回复(Replies)",
@@ -36,7 +35,7 @@ LEGACY_TAB_KEYS = {
 
 
 class StorageError(RuntimeError):
-    """Raised when existing data cannot be read safely; the run must stop to avoid overwriting it."""
+    """本地已有数据文件损坏无法读取时抛出，中止运行以避免覆盖原文件。"""
 
 
 @dataclass
@@ -46,7 +45,7 @@ class CheckpointState:
 
 
 def atomic_write_json(target_path: Path, data: Any, indent: int | None = 2) -> None:
-    """Write JSON atomically via a temporary file + fsync + rename."""
+    """先写入临时文件并刷盘，再替换目标 JSON 文件。"""
     target_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = target_path.with_suffix(target_path.suffix + ".tmp")
     with open(tmp_path, "w", encoding="utf-8") as f:
@@ -70,10 +69,10 @@ class Storage:
         self.state_file = self.user_dir / "state.json"
         self.profile_file = self.user_dir / "profile.json"
 
-    # ------------------------------------------------------------------ tweets
+    # ------------------------------------------------------------------ 推文数据读写
 
     def load_tweets(self) -> dict[str, dict[str, Any]]:
-        """Load tweets.json + replay the crash journal + migrate legacy files. Raises StorageError if corrupt."""
+        """读取 tweets.json、合并中断日志并迁移旧路径文件；若 tweets.json 损坏则抛出 StorageError。"""
         merged: dict[str, dict[str, Any]] = {}
 
         if self.tweets_file.exists():
@@ -126,7 +125,7 @@ class Storage:
                 try:
                     rec = json.loads(line)
                 except ValueError:
-                    bad += 1  # typically a half-written last line after a hard crash
+                    bad += 1  # 通常是进程异常终止时末尾未写完的半行记录
                     continue
                 n += self._merge_items(merged, [rec])
         if bad:
@@ -134,7 +133,7 @@ class Storage:
         return n
 
     def _migrate_legacy_files(self, merged: dict[str, dict[str, Any]]) -> list[Path]:
-        """Merge `data/<user>.json` / `data/<user>_YYYYMMDD_HHMMSS.json`; returns files safe to delete."""
+        """合并旧版 `data/<user>.json` 与 `data/<user>_YYYYMMDD_HHMMSS.json`，返回可安全清理的文件列表。"""
         if not self.data_dir.exists():
             return []
         legacy_re = re.compile(rf"^{re.escape(self.target_user)}(?:_\d{{8}}_\d{{6}})?\.json$")
@@ -154,7 +153,7 @@ class Storage:
         return migrated
 
     def append_journal(self, records: Iterable[dict[str, Any]]) -> int:
-        """Append records to the crash journal and fsync. Raises OSError on failure."""
+        """将记录追加写入中断日志并立即刷盘；写入失败时抛出 OSError。"""
         lines = [json.dumps(r, ensure_ascii=False, separators=(",", ":")) for r in records]
         if not lines:
             return 0
@@ -166,14 +165,14 @@ class Storage:
         return len(lines)
 
     def export(self, tweets: dict[str, dict[str, Any]]) -> int:
-        """Atomically write the sorted tweets.json, then truncate the journal (now redundant)."""
+        """将推文排序后写入 tweets.json，成功后删除中断日志文件。"""
         result = sort_records(tweets.values())
         atomic_write_json(self.tweets_file, result)
         if self.journal_file.exists():
             self.journal_file.unlink()
         return len(result)
 
-    # ------------------------------------------------------------------ checkpoint state
+    # ------------------------------------------------------------------ 断点状态读写
 
     def load_state(self, since_bound: str | None, until_bound: str | None) -> CheckpointState:
         legacy_state = self.data_dir / f".{self.target_user}_state.json"
@@ -215,7 +214,7 @@ class Storage:
         return state
 
     def save_state(self, state: CheckpointState, since_bound: str | None, until_bound: str | None) -> None:
-        """Persist checkpoint. Raises OSError on failure (callers decide how loud to be)."""
+        """保存断点状态到 state.json；写入失败时抛出 OSError。"""
         atomic_write_json(
             self.state_file,
             {
@@ -228,7 +227,7 @@ class Storage:
             },
         )
 
-    # ------------------------------------------------------------------ profile
+    # ------------------------------------------------------------------ 账号资料读写
 
     def load_profile(self) -> dict[str, Any] | None:
         if not self.profile_file.exists():
@@ -249,10 +248,10 @@ class Storage:
         except OSError as exc:
             log.warning("[!] 保存用户资料 %s 失败：%s", self.profile_file, exc)
 
-    # ------------------------------------------------------------------ restart
+    # ------------------------------------------------------------------ 清空重抓备份
 
     def backup_and_reset(self) -> Path | None:
-        """Move tweets / journal / state into backups/<timestamp>/ instead of deleting them."""
+        """将已有的推文、中断日志与断点文件移入 backups/<时间戳>/ 目录，而非直接删除。"""
         files = [p for p in (self.tweets_file, self.journal_file, self.state_file) if p.exists()]
         if not files:
             return None
