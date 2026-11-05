@@ -18,9 +18,8 @@ flowchart TD
     Scope1 & Scope2 & Scope3 & Scope4 --> CheckLocal["2. 读取本地历史数据与断点 (data/用户名/)"]
     CheckLocal --> ModeSelect["选择运行模式：断点续传 / 从头扫描 / 清空重抓"]
 
-    ModeSelect --> BrowserInit["3. 启动本机 Chrome 并加载持久化目录 (.chrome_profile)"]
-    BrowserInit --> StealthInit["注入初始化脚本：修改 webdriver 等浏览器标识"]
-    StealthInit --> AuthCheck{"4. 检查 auth_token 登录状态"}
+    ModeSelect --> BrowserInit["3. 启动本机 Chrome 并加载持久化目录 (.chrome_profile)，去除自动化提示条"]
+    BrowserInit --> AuthCheck{"4. 检查 auth_token 登录状态"}
     AuthCheck -- "已登录" --> ProfileFetch["5. 访问目标主页并解析 UserByScreenName 接口"]
     AuthCheck -- "未登录且有 Cookie 文件" --> InjectCookie["导入 browser_cookies.json"] --> ProfileFetch
     AuthCheck -- "未登录" --> ManualLogin["打开登录页等待手动登录 (最长 3 分钟)"] --> ProfileFetch
@@ -29,21 +28,23 @@ flowchart TD
     SaveProfile --> TabLoop["6. 按顺序进入待抓取的子页面 (跳过已完成的子页面)"]
 
     TabLoop --> CursorCheck{"是否存在未完成游标?"}
-    CursorCheck -- "是 (断点续传)" --> InjectCursor["替换首屏响应中的 Bottom cursor，直接跳至上次断点位置"]
+    CursorCheck -- "是 (断点续传)" --> InjectCursor["page.route 改写首个时间线请求的 cursor，直接从上次断点位置加载"]
     CursorCheck -- "否" --> ScrollLoop["7. 使用 mouse.wheel 分步向下滚动页面 (伴随鼠标随机移动与小幅回滚)"]
     InjectCursor --> ScrollLoop
 
     ScrollLoop --> Intercept["8. 监听并解析对应的 GraphQL 时间线接口 JSON"]
     Intercept --> Filter["过滤 promoted 广告，校验推文作者等于 TARGET_USER"]
     Filter --> Extract["提取正文 (含 note_tweet 长文)、被引用推文 (quoted_tweet)、被回复原帖 (reply_to)"]
-    Extract --> Persist["9. 每满 10 条自动写入 tweets.json，同步更新 state.json 翻页游标"]
+    Extract --> Persist["9. 新数据先追加写入中断日志 (fsync)，再推进 state.json 翻页游标"]
 
     Persist --> RateLimit{"是否遇到 HTTP 429 限流?"}
-    RateLimit -- "是" --> WaitRetry["暂停 30 秒后移动鼠标点击页面重试按钮"] --> ScrollLoop
+    RateLimit -- "是" --> WaitRetry["按 x-rate-limit-reset 或指数退避等待后重试 (最多 4 次)"] --> ScrollLoop
+    RateLimit -- "多次限流" --> KeepCursor["保留断点并结束本次运行"]
     RateLimit -- "否" --> EndCheck{"是否到达页面底部?"}
     EndCheck -- "否" --> ScrollLoop
-    EndCheck -- "是 (或连续 12 次无新数据)" --> MarkDone["标记当前子页面已完成，进入下一个子页面"]
-    MarkDone --> FinalSave["10. 全部完成或 Ctrl+C 中断时保存最终数据并关闭浏览器"]
+    EndCheck -- "是 (或到达起始日期)" --> MarkDone["标记当前子页面已完成，进入下一个子页面"]
+    EndCheck -- "连续 12 次无新数据" --> KeepCursor2["视为异常中止：不标记完成，保留断点"]
+    MarkDone --> FinalSave["10. 全部完成或 Ctrl+C 中断时导出 tweets.json 并关闭浏览器"]
 ```
 
 ### 按运行顺序的功能说明
@@ -51,9 +52,10 @@ flowchart TD
 1. **选择抓取范围与读取本地断点**
    - 启动后在终端选择要抓取的内容类型：原创推文（`Posts`）、纯转推（`Reposts`）、回复（`Replies`）或全部。
    - 自动读取 `data/<TARGET_USER>/` 目录下已有的 `tweets.json`（历史推文）和 `state.json`（上次记录的翻页游标与已完成子页面列表）。若本地已有数据，可选择断点续传、从头扫描或清空重抓。
-2. **启动本地浏览器与修改自动化标识（`stealth.py`）**
-   - 启动本机安装的 Google Chrome，加载 `.chrome_profile/` 目录中的浏览器配置与缓存。
-   - 在页面加载前注入脚本，隐藏 `navigator.webdriver` 标识、设置 `navigator.languages` 语言列表、补充 `window.chrome.runtime` 属性。
+2. **启动本地浏览器（`x_crawler/browser.py`）**
+   - 启动本机安装的 Google Chrome，加载 `.chrome_profile/` 目录中的浏览器配置与缓存；去掉 `--enable-automation` 启动参数（不显示“正受到自动测试软件的控制”提示条），并启用 `--disable-blink-features=AutomationControlled`。
+   - 不再向页面注入任何修改浏览器属性的 JS 脚本：真实 Chrome + 持久化配置本身就是最自然的环境，额外的属性补丁反而会形成可被检测的特征。
+   - 若配置目录被正在运行的 Chrome 占用，会直接提示关闭 Chrome；只有在 Chrome 无法启动时才回退到 Playwright Chromium，并使用独立的 `<CHROME_USER_DATA_DIR>_chromium/` 目录（避免版本不一致损坏 Chrome 配置）。
 3. **检查与保持登录状态**
    - 检查浏览器会话中是否存在有效的 `auth_token` Cookie：若已存在则直接进入抓取流程；若不存在但项目根目录下有 `browser_cookies.json`，则自动导入该文件中的 Cookie；若均无，则在打开的 Chrome 窗口中跳转登录页，等待用户手动完成登录（最长等待 3 分钟），登录状态自动保存在 `.chrome_profile/` 中供后续复用。
 4. **获取并显示目标账号基本信息**
@@ -61,8 +63,8 @@ flowchart TD
    - 在开始滚动抓取前，于终端显示目标账号的昵称、总发帖数、媒体帖数、关注数、粉丝数以及本地已保存的推文条数，并将账号资料保存至 `data/<TARGET_USER>/profile.json`。
 5. **切换子页面与注入断点游标**
    - 按所选范围依次访问 `Posts`（`/user`）、`Reposts`（`/user/reposts`）、`Replies`（`/user/with_replies`）三个子页面；在不同子页面之间切换时，先滚动回页面顶部，再移动鼠标点击对应的顶部标签。
-   - 若处于断点续传模式：已抓取到底部的子页面会直接跳过；未抓完的子页面会在首屏接口返回时将翻页游标（`Bottom cursor`）替换为上次中断时保存的游标，使下一次滚动直接从中断位置向后请求数据。
-6. **模拟鼠标滚轮滚动与鼠标移动点击（`stealth.py`）**
+   - 若处于断点续传模式：已抓取到底部的子页面会直接跳过；未抓完的子页面通过 Playwright `page.route` 将该子页面**首个时间线请求**的 `variables.cursor` 改写为上次保存的游标，页面直接从中断位置开始加载（不向页面注入任何脚本）。若未能拦截到请求，会在终端给出警告并从顶部扫描，原游标保留不被覆盖。
+6. **模拟鼠标滚轮滚动与鼠标移动点击（`x_crawler/stealth.py`）**
    - 在子页面中通过 `page.mouse.wheel()` 分多次向下滚动页面以触发翻页请求，滚动间隙随机移动鼠标位置或小幅向上回滚。
    - 点击页面元素（如切换顶部标签页或点击重试按钮）时，记录上一次鼠标停留坐标，按曲线轨迹分步移动鼠标至目标元素内部后再执行按下与抬起操作。
 7. **监听 GraphQL 接口并过滤非目标数据**
@@ -73,10 +75,12 @@ flowchart TD
    - **纯转推（`type = "retweet"`）**：从内嵌的 `retweeted_status_result` 字段中提取原作者用户名（`original_author`）与未截断的原帖全文。
    - **被引用的推文（`quoted_tweet`）**：当推文包含引用转发（Quote Post）时，从 `quoted_status_result` 字段中提取被引用原帖的 ID、作者、发布时间与正文。
    - **被回复的原帖（`reply_to`）**：当推文属于回复（`type = "reply"`）时，从同一接口返回的对话列表中查找被回复的上游原帖，记录其 ID、作者、发布时间与正文。
-9. **定时保存、限流等待与结束归档**
-   - 抓取过程中每新增 10 条推文自动写入 `data/<TARGET_USER>/tweets.json`，每次翻页同步将最新游标写入 `data/<TARGET_USER>/state.json`（均采用临时文件替换方式写入，防止按 `Ctrl+C` 中断时损坏文件）。
-   - 当接口返回 HTTP 429 状态码（请求频率限制）时，程序暂停 30 秒，随后移动鼠标点击页面上的重试按钮继续抓取。
-   - 当子页面滚动到底部（接口返回空页或连续 12 次滚动无新数据）时，将该子页面记入已完成列表；全部子页面抓取结束或按 `Ctrl+C` 退出时，保存最终去重排序后的 JSON 文件并关闭浏览器。
+9. **安全保存、限流等待与结束归档（`x_crawler/storage.py`）**
+   - 每收到一页数据，新增（或补全了回复上下文）的推文会先追加写入 `tweets.journal.jsonl` 中断日志并 `fsync`，**之后**才把新的翻页游标写入 `state.json`，因此断点游标永远不会超前于已落盘的数据（即使进程被强杀或断电）。
+   - 每累计 200 条以及运行结束 / `Ctrl+C` 时，将全部数据去重排序后原子写入 `tweets.json`（临时文件 + `fsync` + 替换），随后清空中断日志；下次启动时若发现残留的中断日志，会自动合并恢复。
+   - 当接口返回 HTTP 429（请求频率限制）时，优先按响应头 `x-rate-limit-reset` 等待到限额重置，否则按 60s → 120s → 240s… 指数退避（单次最长 20 分钟），然后点击重试按钮继续；连续 4 次仍被限流则保留断点并结束本次运行。
+   - 只有**真正到达时间线底部**（接口连续返回空页）、到达 `SINCE_DATE` 或栏目本身为空时，才将子页面记入已完成列表；若因连续 12 次滚动无新数据而停止（可能是网络或接口异常），则**保留断点游标**，下次可继续续传。
+   - 若 `tweets.json` 无法解析，程序会直接中止且不改动该文件，避免历史数据被覆盖。
 
 ## 环境要求
 
@@ -106,12 +110,17 @@ uv run playwright install chromium
 | --- | --- | --- |
 | `TARGET_USER` | `bhupen07` | 目标 X 账号的用户名（不带 `@`） |
 | `DATA_DIR` | `data` | 数据文件的保存根目录 |
-| `SINCE_DATE` | 空（不限制） | 可选：抓取起始日期（含当天，格式 `YYYY-MM-DD`，如 `2025-01-01`）；滚动到早于该日期的推文时自动停止当前子页面 |
+| `SINCE_DATE` | 空（不限制） | 可选：抓取起始日期（含当天，格式 `YYYY-MM-DD`，如 `2025-01-01`）；滚动到早于该日期的推文时自动停止当前子页面。格式无效时程序会报错退出 |
 | `UNTIL_DATE` | 空（不限制） | 可选：抓取结束日期（含当天，格式 `YYYY-MM-DD`，如 `2025-12-31`）；晚于该日期的推文跳过不保存 |
+| `DATE_TZ` | 系统时区 | `SINCE_DATE` / `UNTIL_DATE` 按哪个时区的自然日解释，如 `Asia/Shanghai`、`UTC` |
 | `CHROME_PATH` | 自动查找本机 Chrome | 本机 Google Chrome 可执行文件路径（macOS 默认 `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`） |
 | `CHROME_USER_DATA_DIR` | `.chrome_profile` | 本地 Chrome 用户数据目录，用于保存登录状态 |
 | `PROXY` | 空（使用系统网络） | 可选代理地址，例如 `http://127.0.0.1:7890` |
 | `HEADLESS` | `false` | 是否使用无头模式运行浏览器（`true` / `false`） |
+| `BLOCK_SERVICE_WORKERS` | `true` | 是否禁用页面 Service Worker（保证断点续传的请求改写一定生效） |
+| `COOKIE_FILE` | `browser_cookies.json` | 可选的导入 Cookie 文件路径 |
+
+`TARGET_USER` 只能包含字母、数字和下划线（1~15 位），否则程序会报错退出。
 
 ## 登录方式
 
@@ -125,8 +134,17 @@ uv run playwright install chromium
 执行以下命令启动程序：
 
 ```bash
-uv run python main.py
+uv run python main.py            # 或安装后使用：uv run x-crawler
 ```
+
+命令行参数优先于 `.env`，同时提供 `--types` 与 `--mode` 时可完全非交互运行（适合定时任务）：
+
+```bash
+uv run python main.py --user someone --since 2025-01-01 --types posts,replies --mode resume
+uv run python main.py --help     # 查看全部参数（--until / --tz / --data-dir / --headless / -v 调试日志）
+```
+
+退出码：`0` 全部栏目完成；`1` 有栏目未完成（已保留断点）；`2` 配置 / 登录 / 数据文件错误；`130` 用户中断。
 
 启动后可输入编号选择要抓取的内容类型（多选用空格分隔，直接按回车默认选 `4`）：
 
@@ -137,19 +155,21 @@ uv run python main.py
 | `3` | `x.com/<user>/with_replies`（`Replies`） | `UserRepliesTimeline` | 回复 Replies（含被回复原帖与引用推文上下文） |
 | `4` 或直接回车 | 依次访问 `Posts`、`Reposts`、`Replies` | 上述全部三个接口 | 依次抓取三个子页面并按 ID 去重合并 |
 
-当页面到底部或连续 12 次滚动没有新数据时，当前子页面抓取结束。数据保存在 `data/<TARGET_USER>/` 目录下：
+当页面到底部时，当前子页面抓取结束；连续 12 次滚动没有新数据时也会停止，但该子页面不会被标记为完成。数据保存在 `data/<TARGET_USER>/` 目录下：
 
 ```text
 data/<TARGET_USER>/
-├── tweets.json    # 推文列表（按发布时间从新到旧排序）
-├── profile.json   # 账号基本信息（总发帖数、媒体帖数、粉丝数、简介等）
-└── state.json     # 翻页游标与子页面完成状态
+├── tweets.json            # 推文列表（按发布时间从新到旧排序）
+├── tweets.journal.jsonl   # 运行中的中断日志（正常结束后自动清空，异常退出后下次启动自动合并）
+├── profile.json           # 账号基本信息（总发帖数、媒体帖数、粉丝数、简介等）
+├── state.json             # 翻页游标与子页面完成状态
+└── backups/<时间戳>/       # “清空重抓”时移入的旧数据
 ```
 
 如果本地已存在历史数据或未完成的翻页游标，启动时可选择：
 1. **断点续传（默认）**：已抓取到底部的子页面直接跳过，未完成的子页面从上次记录的游标位置继续向后抓取。
 2. **从头扫描**：从页面顶部最新推文开始向下滚动，抓取结果与本地已有数据合并去重。
-3. **清空重抓**：删除本地已保存的推文与游标记录，重新开始抓取。
+3. **清空重抓**：将本地已保存的推文与游标记录移入 `backups/<时间戳>/` 后重新开始抓取。
 
 ### 输出 JSON 结构说明
 
@@ -161,6 +181,8 @@ data/<TARGET_USER>/
     "author": "bhupen07",
     "type": "reply",
     "original_author": "",
+    "original_id": null,
+    "original_created_at": null,
     "text": "目标用户发布的回复正文",
     "reply_to": {
       "id": "1879999999999999999",
@@ -184,6 +206,7 @@ data/<TARGET_USER>/
 - `author`：发布该推文的用户名（`screen_name`）
 - `type`：推文类型，取值为 `tweet`（原创推文或带评论引用推文）、`retweet`（不带评论的纯转推）或 `reply`（回复）
 - `original_author`：当 `type` 为 `retweet` 时记录被转发原帖的作者用户名，其他类型为空字符串
+- `original_id` / `original_created_at`：当 `type` 为 `retweet` 时记录被转发原帖的 ID 与 UTC 发布时间，其他类型为 `null`（旧版本采集的记录可能没有这两个字段）
 - `text`：推文全文（当 `type` 为 `retweet` 时，记录被转发原帖的全文）
 - `reply_to`：当 `type` 为 `reply` 时，记录被回复原帖的 `id`、`author`、`created_at` 和 `text`；非回复时为 `null`（若被回复原帖已被删除或不可见，则 `text` 和 `created_at` 为 `null`）
 - `quoted_tweet`：当推文引用了其他推文时，记录被引用推文的 `id`、`author`、`created_at` 和 `text`；未引用时为 `null`
@@ -250,11 +273,28 @@ X 个人主页顶部共有 4 个标签页，前 3 个分别对应上述三类帖
 
 ```text
 .
-├── main.py          # 抓取主程序（浏览器控制、接口监听、数据解析与断点保存）
-├── stealth.py       # 浏览器属性修改与鼠标移动、滚轮滚动、点击模拟
-├── .env.example     # 环境变量配置示例
-├── pyproject.toml   # 项目依赖配置
-└── uv.lock          # 依赖版本锁定文件
+├── main.py                # 兼容入口（等价于 x-crawler 命令）
+├── x_crawler/
+│   ├── cli.py             # 命令行入口、交互选择、整体流程编排
+│   ├── config.py          # 配置（.env + 命令行参数）与校验
+│   ├── browser.py         # Chrome 启动、Cookie 导入、登录检测
+│   ├── crawler.py         # 子页面表、滚动循环、限流退避、page.route 断点续传
+│   ├── collector.py       # GraphQL 响应监听、过滤、回复上下文补全、落盘顺序控制
+│   ├── parser.py          # 纯函数 GraphQL 解析（无 Playwright 依赖）
+│   ├── storage.py         # tweets.json / 中断日志 / state.json / profile.json 读写
+│   └── stealth.py         # 鼠标移动、滚轮滚动、点击模拟
+├── tests/                 # 单元测试（基于合成 GraphQL 数据，无需浏览器）
+├── .env.example           # 环境变量配置示例
+├── pyproject.toml         # 项目依赖与工具配置（ruff / pytest）
+└── uv.lock                # 依赖版本锁定文件
+```
+
+开发与测试：
+
+```bash
+uv sync --group dev
+uv run pytest              # 或 uv run python -m unittest discover -s tests -t .
+uv run ruff check .
 ```
 
 运行过程中生成的本地文件（已在 `.gitignore` 中忽略）：
@@ -271,6 +311,10 @@ data/                 # 抓取结果保存目录
 - **如何切换登录的 X 账号？**
   删除项目根目录下的 `.chrome_profile/` 文件夹（如果存在 `browser_cookies.json` 也一并删除），重新运行 `uv run python main.py`，在弹出的 Chrome 窗口中登录新账号即可。
 - **遇到“触发 X 接口频率限制 (429)”提示怎么办？**
-  X 对单个账号在短时间内的翻页请求次数有限制。程序检测到 429 状态码后会自动等待 30 秒，并点击页面上的重试按钮继续抓取。
+  X 对单个账号在短时间内的翻页请求次数有限制（通常以 15 分钟为窗口）。程序会按响应头中的重置时间或指数退避自动等待并重试；连续 4 次仍被限流时会保留断点并结束运行，稍后选择“断点续传”即可继续。
+- **提示“浏览器配置目录正被其他 Chrome 进程占用”？**
+  关闭所有使用 `.chrome_profile/` 的 Chrome 窗口后重试。
+- **提示数据文件无法读取并中止？**
+  说明 `tweets.json` 已损坏。程序不会覆盖它；请修复或移走该文件后重试（同目录下的 `tweets.journal.jsonl` 可能保留了最近采集的记录，下次启动会自动合并）。
 - **如何使用无头模式在后台运行？**
   先在默认有头模式下运行一次并完成登录（使登录状态保存在 `.chrome_profile/` 中），之后在 `.env` 中将 `HEADLESS` 设为 `true`。

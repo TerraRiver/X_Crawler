@@ -2,13 +2,16 @@
 .env
 browser_cookies.json
 cookies.json
-.chrome_profile/
+.chrome_profile*/
 
 # Generated data
 data/
 
-# Python environments and caches
+# Python environments, build artifacts and caches
 .venv/
+build/
+dist/
+*.egg-info/
 __pycache__/
 *.py[cod]
 .pytest_cache/
